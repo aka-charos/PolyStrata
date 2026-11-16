@@ -1194,6 +1194,10 @@ void usage() {
                  "                         fit in the RAM that is free, else what is free less 4 GiB; -1: all of them)\n"
                  "  --lock-experts         lock the experts outside VRAM in RAM, so the system cannot drop them from the\n"
                  "                         file cache when other programs want the memory (Linux: up to ulimit -l)\n"
+                 "  --dax                  for a model on a volume that maps persistent memory directly (Optane in App\n"
+                 "                         Direct mode, formatted with DAX): every expert outside VRAM stays mapped, with\n"
+                 "                         no RAM budgeted for them, and none is read ahead or dropped between requests;\n"
+                 "                         a file the system does not say is one is named, and the load is as without\n"
                  "  --prompt-batch N       prompt tokens read at a time (default 1024); about 1.4 MiB of VRAM each\n"
                  "  --stage-mib N          VRAM the experts outside the cache pass through in a prompt batch (default\n"
                  "                         128 on an NVIDIA card where a longer read widens it, else 2048; never more\n"
@@ -1304,6 +1308,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-gpu-experts") o.gpu_experts = false;
         else if (a == "--any-node") o.stay_near = false;
         else if (a == "--lock-experts") o.lock_experts = true;
+        else if (a == "--dax") o.dax = true;
         else if (a == "--no-graphs") o.graphs = false;
         else if (a == "--kv-whole") o.kv_grow = false;
         else if (a == "--kv") {

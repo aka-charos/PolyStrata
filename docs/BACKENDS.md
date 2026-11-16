@@ -2142,6 +2142,10 @@ in (mlock under Linux, VirtualLock under Windows), and between requests unlocks 
 locks the ones it has given up. Linux locks no more than `ulimit -l` allows; past it the engine says how much it
 locked and the rest stay in the file cache. It does not go with `--ram-experts-mib`.
 
+`--dax`, off by default, is for a model on a volume that maps persistent memory directly: the engine then sets no
+budget by itself and does not use `--ram-experts-mib`, since the mapped experts are not pages of the file cache
+there. It has not been measured: [PMEM.md](PMEM.md).
+
 On the laptop with Qwen3.6 UD-Q3_K_M it locked 10.1 GiB. With Windows emptying the engine's working set from
 outside, as it does when memory runs short, 0.07 GiB of the 14.05 stayed without the lock and 10.13 GiB with it.
 After a 32K prompt the cache gave up 345 experts, and 10.63 GiB stayed. With the cache the same size in both runs

@@ -18,6 +18,7 @@
 #include "strata/gpu/metal.hpp"
 #endif
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/platform/dax.hpp"
 #include "strata/platform/memory.hpp"
 
 #include "ggml.h"
@@ -255,12 +256,17 @@ void touch_pages(const uint8_t* p, size_t n) {
 // pages, so a second thread reads the spans from the file (read_cached()) while this one touches them: from an
 // empty cache it runs ahead and the touches find the pages in memory.  When the cache holds them it only copies
 // what it reads, beside the touches.  PrefetchVirtualMemory() returns at once and brings nothing in.
+//
+// `through_cache` false, for files mapped straight from persistent memory (Engine::dax_): the file cache holds
+// no copy of them, so read_cached() would only copy them into a buffer it throws away.  The touches stay: they
+// put the pages into this process's page table, with nothing to read from a disk.
 void map_pages(const std::vector<std::pair<const uint8_t*, size_t>>& spans, const Shards& model,
-               const std::atomic<bool>& quit) {
+               const std::atomic<bool>& quit, bool through_cache = true) {
 #ifdef _WIN32
-    std::jthread reader(read_cached, std::cref(spans), std::cref(model), std::cref(quit));
+    std::jthread reader;
+    if (through_cache) reader = std::jthread(read_cached, std::cref(spans), std::cref(model), std::cref(quit));
 #else
-    (void) model;
+    (void) model, (void) through_cache;
 #endif
     constexpr size_t kLook = size_t(1) << 24;   // `quit` is looked at every 16 MiB
     for (const auto& s : spans)
@@ -754,6 +760,7 @@ void Engine::zero_vram(void* dst, size_t bytes) {
 // within 2% of the limit, with no OOM kill counted by the kernel.  Said once at load; the remedy is RAM.
 void Engine::mind_memory() {
 #ifdef __linux__
+    if (dax_) return;   // the files are not in the file cache, so a memory limit near their size says nothing
     if (split_ && lo_ > 0) return;   // the first card's engine says it for all of them
     static const char* const files[] = {"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"};
     unsigned long long limit = 0;
@@ -1823,7 +1830,8 @@ void Engine::fill_expert_cache() {
     if (!opt_.gpu_experts || n_moe_ == 0) return;
     size_t free_b = 0, total_b = 0;
     ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
-    const size_t ram = ram_available(), files = gg_->bytes() + (dg_ ? dg_->bytes() : 0);
+    // less the files Options::dax found mapped from persistent memory (0 without it): those are not the file cache's
+    const size_t ram = ram_available(), files = gg_->bytes() + (dg_ ? dg_->bytes() : 0) - dax_file_bytes_;
     ram_tight_ = ram > 0 && files + (5ULL << 30) > ram;
     // 256 MiB at least, whatever was asked: the launches recorded later take theirs out of the reserve (mind_vram())
     reserve_mib_ = opt_.vram_reserve_mib >= 0 ? std::max(opt_.vram_reserve_mib, 256) :
@@ -2617,6 +2625,36 @@ void Engine::load(const Options& o) {
                      stream_stage_ ? "streaming CPU stores for expert staging" : "unsupported CPU build; stock copies");
     gg_ = std::make_unique<Shards>(opt_.model);
     if (!opt_.draft_model.empty() && opt_.draft && opt_.window != 1) dg_ = std::make_unique<Shards>(opt_.draft_model);
+    // Options::dax: the files the system says are mapped straight from persistent memory.  The routed experts are
+    // the model's, so it is the model's files that decide (dax_); a draft's own file on a drive only counts as a
+    // file on a drive (dax_file_bytes_, dax_views_).
+    dax_ = false;
+    dax_file_bytes_ = 0;
+    dax_views_.clear();
+    if (opt_.dax) {
+        dax_ = true;
+        for (const Shards* sh : {gg_.get(), dg_.get()}) {
+            if (!sh) continue;
+            const auto v = sh->views();
+            for (size_t i = 0; i < sh->paths().size(); ++i) {
+                if (strata::platform::file_is_dax(sh->paths()[i])) {
+                    dax_file_bytes_ += v[i].second;
+                    if (v[i].first) dax_views_.emplace_back(v[i].first, v[i].second);
+                } else if (sh == gg_.get()) {
+                    dax_ = false;
+                    std::fprintf(stderr, "strata-poly: --dax: the system does not say that %s is mapped straight from "
+                                         "persistent memory (a drive; a compressed, encrypted or sparse file; Linux "
+                                         "before 5.8): planning for RAM as without --dax (STRATA_DAX=1 says it is)\n",
+                                 sh->paths()[i].c_str());
+                }
+            }
+        }
+        if (dax_)
+            std::fprintf(stderr, "strata-poly: --dax: the model's files are on a volume that maps persistent memory "
+                                 "directly%s: every expert outside VRAM stays mapped, no RAM is budgeted for them, "
+                                 "and they are neither read ahead nor dropped between requests\n",
+                         strata::platform::dax_override() == 1 ? " (STRATA_DAX=1 says so)" : "");
+    }
 #if defined(STRATA_GPU_METAL)
     if (opt_.kv_format == KvFmt::kAuto) {
         const MetaValue* arch = gg_->get("general.architecture");
@@ -2770,7 +2808,8 @@ void Engine::load(const Options& o) {
     // mapping the attention caches - finds what it expects.
     ck(cudaStreamSynchronize(cs(st_)), "the load");
     // The card has the dense weights now, and the CPU does not read them again.
-    for (const auto& [p, n] : uploaded_) drop_pages(p, n);
+    for (const auto& [p, n] : uploaded_)
+        if (!on_dax(p)) drop_pages(p, n);   // a DAX file's pages are not the file cache's: nothing to give back
     uploaded_ = {};
     // A card of a split that has less free beside its layers than the reserve it keeps by default runs out of VRAM
     // in a later request, where one card alone can do nothing else.  It may be that another program held VRAM when
@@ -2820,11 +2859,19 @@ void Engine::load(const Options& o) {
     // mapping, experts that do not fit are read back a fault at a time: on the lab's machine held to 12 GB, Qwen3.6
     // UD-Q3_K_M wrote 51, 73 and 99 tokens/s (a chat, after a 24,000-token prompt, a chat again) with every expert
     // mapped and 61, 88 and 120 with a budget of 6 GiB.
+    // dax_: a budget divides RAM between copies of experts and pages of the file cache, and the mapping's pages
+    // are not the file cache's there.  RAM copies above persistent memory are not built, so every expert stays mapped.
+    if (dax_ && opt_.ram_experts_mib >= 0) {
+        std::fprintf(stderr, "strata-poly: --ram-experts-mib %lld is not used with --dax: every expert outside VRAM "
+                             "stays mapped\n", (long long) opt_.ram_experts_mib);
+        opt_.ram_experts_mib = -1;
+    }
     if (opt_.ram_experts_mib < -1) {
         constexpr size_t kRamHeadroom = size_t(4) << 30;
         const size_t avail = ram_available();
         opt_.ram_experts_mib = -1;
-        if (avail && !opt_.lock_experts && outside_bytes_ + kRamHeadroom > avail) {
+        // dax_: the mapped experts are not pages of the file cache, so the RAM that is free does not bound them
+        if (avail && !opt_.lock_experts && !dax_ && outside_bytes_ + kRamHeadroom > avail) {
             opt_.ram_experts_mib = std::max<int64_t>(1024, (int64_t) ((avail > kRamHeadroom ? avail - kRamHeadroom : 0) >> 20));
             std::fprintf(stderr, "strata-poly: %.1f GiB of RAM free for %.1f GiB of experts outside VRAM: they do not fit, "
                                  "so the ones used most stay in RAM (--ram-experts-mib -1 maps them all)\n",
@@ -2973,7 +3020,7 @@ void Engine::load(const Options& o) {
         } else
 #endif
         mapper_ = std::thread([this, cpu = std::move(cpu), outside = std::move(outside)] {
-            map_pages(cpu, *gg_, map_quit_);
+            map_pages(cpu, *gg_, map_quit_, !dax_);
             if (!outside.empty()) lock_outside(outside);
         });
     }
@@ -3382,12 +3429,16 @@ void Engine::trim() {
     std::partial_sort(held.begin(), held.begin() + (ptrdiff_t) n, held.end(), [](const Held& a, const Held& b) {
         return a.recent != b.recent ? a.recent > b.recent : a.used > b.used;
     });
-    for (size_t i = 0; i < n; ++i) expert_bytes(layers_[(size_t) held[i].il], held[i].e, held[i].e + 1, drop_pages);
+    // not a DAX file's (Options::dax): dropping them gives no RAM back, and the next token to use one faults it in
+    const auto drop = [this](const uint8_t* p, size_t bytes) {
+        if (!on_dax(p)) drop_pages(p, bytes);
+    };
+    for (size_t i = 0; i < n; ++i) expert_bytes(layers_[(size_t) held[i].il], held[i].e, held[i].e + 1, drop);
     if (pool_)   // and the CPU's outside kept_, which come from pool_; kept_'s stay for the next answer
         for (size_t il = 0; il < layers_.size(); ++il) {
             const Layer& L = layers_[il];
             const uint8_t* k = kept_.data() + il * (size_t) n_expert_;
-            if (L.moe) expert_runs(L, n_expert_, [&](int e) { return !L.slot[(size_t) e] && !k[e]; }, drop_pages);
+            if (L.moe) expert_runs(L, n_expert_, [&](int e) { return !L.slot[(size_t) e] && !k[e]; }, drop);
         }
     hfree(h_res_);
     h_res_ = nullptr;

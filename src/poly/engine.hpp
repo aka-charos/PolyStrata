@@ -93,6 +93,11 @@ struct Options {
     bool lock_experts = false;    ///< the experts outside VRAM locked into RAM, so the system cannot drop them from
                                   ///< the file cache when another program wants the memory (Linux: up to ulimit -l)
     bool stay_near = true;       ///< with several NUMA nodes, keep the CPU threads on the one that holds the experts
+    bool dax = false;             ///< plan for a model whose files are mapped straight from persistent memory
+                                  ///< (strata/platform/dax.hpp), when the system says every one of them is: the
+                                  ///< experts outside VRAM all stay mapped, with no RAM budgeted for them, and are
+                                  ///< neither read ahead through the file cache nor dropped between requests.
+                                  ///< When it says one is not, the load says which and plans as without this.
     bool graphs = true;           ///< a token's fixed launches are recorded once, a CUDA graph a layer, and replayed
     bool kv_grow = true;          ///< the attention caches get VRAM as the sequence grows, where the card can map it
                                   ///< so; false: for the whole context at load, as the expert cache gets the rest
@@ -786,6 +791,15 @@ protected:
     int asked_reserve_mib_ = -1; ///< Options::vram_reserve_mib as load() got it
     int reserve_mib_ = 0;        ///< what the cache was sized to leave free
     bool ram_tight_ = false;     ///< the machine's RAM is within 5 GiB of the model's files (fill_expert_cache())
+    bool dax_ = false;           ///< Options::dax and every file of the model (not of the draft) is a DAX one
+    size_t dax_file_bytes_ = 0;  ///< with Options::dax: the bytes of the files that are, the draft's among them
+    /// with Options::dax: those files' mappings, whose pages are not the file cache's and are not dropped
+    std::vector<std::pair<const uint8_t*, size_t>> dax_views_;
+    bool on_dax(const uint8_t* p) const {
+        for (const auto& [base, bytes] : dax_views_)
+            if (p >= base && p < base + bytes) return true;
+        return false;
+    }
     int minds_ = 0;              ///< mind_vram()'s calls
     int full_cached_ = 0;        ///< the cache as load() filled it: its experts and their bytes
     size_t full_bytes_ = 0;

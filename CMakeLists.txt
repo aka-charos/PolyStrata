@@ -303,6 +303,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(host_limits_test tests/platform/host_limits_test.cpp)
   target_include_directories(host_limits_test PRIVATE include)
   add_test(NAME host_limits_test COMMAND host_limits_test)
+  # whether a file is mapped straight from persistent memory (strata-poly --dax): header-only, no GPU
+  add_executable(dax_test tests/platform/dax_test.cpp)
+  target_include_directories(dax_test PRIVATE include)
+  add_test(NAME dax_test COMMAND dax_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
